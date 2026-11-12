@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  accident-detection-cloud:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: accident_detection_cloud_service
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=production
+      - INFERENCE_MODE=stub  # Switch to 'model' when Member 3 provides weights
+      - TIMEOUT_SECONDS=5.0
+      - CONFIDENCE_THRESHOLD=0.65
+      - MOCK_INFERENCE_LATENCY=0.35
+      - CLEANUP_TEMP_FILES=true
+      - LOG_LEVEL=INFO
+    volumes:
+      - ../logs:/app/logs
+      - ../models:/app/models
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+

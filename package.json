@@ -1,0 +1,11 @@
+{
+  "name": "cloud-ai-deployment",
+  "version": "1.0.0",
+  "description": "AI-Assisted Smart Vehicle Accident Detection Cloud Service",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  }
+}
+
