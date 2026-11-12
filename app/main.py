@@ -76,8 +76,14 @@ def _load_model():
         # Try to download model from Google Drive if not present
         _download_model_from_gdrive()
 
-        # Add project root to path so `inference` package is importable
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        # Add both the project root AND the app parent to sys.path
+        # so `inference` package is importable from wherever Render places files
+        project_root = Path(__file__).resolve().parent.parent
+        app_parent = Path(__file__).resolve().parent
+        for p in [str(project_root), str(app_parent)]:
+            if p not in sys.path:
+                sys.path.insert(0, p)
+
         from inference.model_loader import load_accident_model
         from inference.predictor import AccidentPredictor
 
