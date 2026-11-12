@@ -1,23 +1,25 @@
 """
-Accident Detection Cloud API
+Accident Detection Cloud API v3.0 — Async Job Queue
 Member 4 — Cloud & AI Deployment
-BMSCE Major Project: AI-Assisted Smart Vehicle Accident Detection
 
 Endpoints:
-  POST /predict          — Primary endpoint (Member 3 spec + Pi integration)
-  POST /api/v1/detect    — Contract B endpoint (Member 1 fail-safe logic)
+  POST /predict          — Submit video → returns job_id instantly
+  GET  /result/{job_id} — Poll for result
+  POST /api/v1/detect    — Contract B (sync, for Member 1 fail-safe)
   GET  /health           — Health check
-  GET  /                 — Status dashboard
+  GET  /                 — Dashboard
 """
 
 import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Dict
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,68 +36,134 @@ logging.basicConfig(
 logger = logging.getLogger("accident_api")
 
 # ---------------------------------------------------------------------------
-# Model — loaded once at startup
+# Config
 # ---------------------------------------------------------------------------
-MODEL = None
-DEVICE = None
-PREDICTOR = None
+CHECKPOINT_PATH = Path(os.getenv("CHECKPOINT_PATH", "model/best.pt"))
+THRESHOLD       = float(os.getenv("DECISION_THRESHOLD", "0.50"))
+CONSEC_WINDOWS  = int(os.getenv("CONSECUTIVE_WINDOWS", "2"))
+GDRIVE_FILE_ID  = os.getenv("MODEL_GDRIVE_FILE_ID", "")
+
+# ---------------------------------------------------------------------------
+# In-memory job store  {job_id -> dict}
+# ---------------------------------------------------------------------------
+JOBS: Dict[str, dict] = {}
+
+# ---------------------------------------------------------------------------
+# Model globals
+# ---------------------------------------------------------------------------
+PREDICTOR        = None
+DEVICE           = None
 MODEL_LOAD_ERROR = None
 
-CHECKPOINT_PATH = Path(os.getenv("CHECKPOINT_PATH", "model/best.pt"))
-THRESHOLD = float(os.getenv("DECISION_THRESHOLD", "0.50"))
-CONSECUTIVE_WINDOWS = int(os.getenv("CONSECUTIVE_WINDOWS", "2"))
 
-# Google Drive file ID for best.pt (set via Render env var MODEL_GDRIVE_FILE_ID)
-MODEL_GDRIVE_FILE_ID = os.getenv("MODEL_GDRIVE_FILE_ID", "")
+# ---------------------------------------------------------------------------
+# Model download + load
+# ---------------------------------------------------------------------------
 
-
-def _download_model_from_gdrive():
-    """Download best.pt from Google Drive if not already present."""
-    if not MODEL_GDRIVE_FILE_ID:
-        return  # No Drive ID configured — skip
-    if CHECKPOINT_PATH.exists():
-        logger.info(f"Checkpoint already present at {CHECKPOINT_PATH}, skipping download.")
+def _download_from_gdrive():
+    if not GDRIVE_FILE_ID:
         return
-
-    logger.info(f"Downloading model from Google Drive (ID: {MODEL_GDRIVE_FILE_ID}) ...")
+    if CHECKPOINT_PATH.exists():
+        logger.info(f"Checkpoint already at {CHECKPOINT_PATH}, skipping download.")
+        return
+    logger.info(f"Downloading model from Google Drive ({GDRIVE_FILE_ID}) ...")
     CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        import gdown
-        url = f"https://drive.google.com/uc?id={MODEL_GDRIVE_FILE_ID}"
-        gdown.download(url, str(CHECKPOINT_PATH), quiet=False)
-        logger.info(f"Model downloaded to {CHECKPOINT_PATH} ({CHECKPOINT_PATH.stat().st_size // 1024} KB)")
-    except Exception as exc:
-        logger.error(f"Failed to download model from Google Drive: {exc}")
-        raise
+    import gdown
+    gdown.download(
+        f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}",
+        str(CHECKPOINT_PATH),
+        quiet=False,
+    )
+    logger.info(f"Downloaded {CHECKPOINT_PATH.stat().st_size // 1024} KB")
 
 
 def _load_model():
-    global MODEL, DEVICE, PREDICTOR, MODEL_LOAD_ERROR
+    global PREDICTOR, DEVICE, MODEL_LOAD_ERROR
     try:
-        # Try to download model from Google Drive if not present
-        _download_model_from_gdrive()
+        _download_from_gdrive()
 
-        # Add project root to sys.path so root-level `inference/` package is found
-        # NOTE: do NOT add app/ dir — it has an old inference/ that would shadow the real one
-        project_root = Path(__file__).resolve().parent.parent
-        if str(project_root) not in sys.path:
-            sys.path.insert(0, str(project_root))
+        # Ensure root-level `inference/` package is importable
+        project_root = str(Path(__file__).resolve().parent.parent)
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
 
         from inference.model_loader import load_accident_model
-        from inference.predictor import AccidentPredictor
+        from inference.predictor   import AccidentPredictor
 
         logger.info(f"Loading model from {CHECKPOINT_PATH} ...")
-        MODEL, DEVICE = load_accident_model(CHECKPOINT_PATH)
-        PREDICTOR = AccidentPredictor(MODEL, DEVICE)
-        logger.info(f"Model loaded successfully on {DEVICE}")
+        model, DEVICE  = load_accident_model(CHECKPOINT_PATH)
+        PREDICTOR       = AccidentPredictor(model, DEVICE)
+        logger.info(f"Model loaded on {DEVICE}")
+
     except FileNotFoundError:
         MODEL_LOAD_ERROR = f"Checkpoint not found: {CHECKPOINT_PATH}"
-        logger.warning(MODEL_LOAD_ERROR + " — running in STUB mode")
+        logger.warning(MODEL_LOAD_ERROR + " — STUB mode")
     except Exception as exc:
         MODEL_LOAD_ERROR = str(exc)
-        logger.error(f"Model load failed: {exc} — running in STUB mode")
+        logger.error(f"Model load error: {exc} — STUB mode")
 
+
+# ---------------------------------------------------------------------------
+# Inference helpers
+# ---------------------------------------------------------------------------
+
+def _stub_result(video_path: str) -> dict:
+    return {
+        "video_path": video_path, "prediction": "NORMAL",
+        "probabilities": [0.1], "windows": 1,
+        "preprocessing_time": 0.0, "inference_time": 0.0,
+        "total_processing_time": 0.0,
+    }
+
+
+def _run_inference(tmp_path: str) -> dict:
+    if PREDICTOR is not None:
+        return PREDICTOR.predict(tmp_path, threshold=THRESHOLD,
+                                 consecutive_windows=CONSEC_WINDOWS)
+    return _stub_result(tmp_path)
+
+
+def _inference_worker(job_id: str, tmp_path: str):
+    """Runs in a background thread. Updates JOBS[job_id] when done."""
+    logger.info(f"[{job_id}] Background inference started")
+    t0 = time.perf_counter()
+    try:
+        result = _run_inference(tmp_path)
+        elapsed = round(time.perf_counter() - t0, 2)
+
+        accident   = result["prediction"] == "ACCIDENT"
+        probs      = result["probabilities"]
+        risk_score = round(float(max(probs)) if probs else 0.0, 4)
+
+        JOBS[job_id] = {
+            "status":               "done",
+            "success":              True,
+            "accident_detected":    accident,
+            "risk_score":           risk_score,
+            "message":              "Potential accident detected" if accident else "Normal driving",
+            "inference_time_seconds": elapsed,
+            "windows_analysed":     result["windows"],
+            "probabilities":        probs,
+        }
+        logger.info(f"[{job_id}] Done in {elapsed}s | {result['prediction']} | risk={risk_score}")
+
+    except Exception as exc:
+        logger.error(f"[{job_id}] Inference error: {exc}")
+        JOBS[job_id] = {
+            "status":  "error",
+            "success": False,
+            "message": str(exc),
+        }
+    finally:
+        try:
+            Path(tmp_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# App lifecycle
+# ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -103,158 +171,91 @@ async def lifespan(app: FastAPI):
     yield
 
 
-# ---------------------------------------------------------------------------
-# App
-# ---------------------------------------------------------------------------
 app = FastAPI(
     title="Accident Detection Cloud API",
-    version="2.0.0",
-    description="MobileNetV2+GRU inference service for vehicle accident detection",
+    version="3.0.0",
+    description="Async MobileNetV2+GRU inference for vehicle accident detection",
     lifespan=lifespan,
 )
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
 
 
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _stub_predict(video_path: str) -> dict:
-    """Fallback when model weights are unavailable (returns NORMAL)."""
-    return {
-        "video_path": video_path,
-        "prediction": "NORMAL",
-        "probabilities": [0.1],
-        "windows": 1,
-        "preprocessing_time": 0.0,
-        "inference_time": 0.0,
-        "total_processing_time": 0.0,
-    }
-
-
-def _run_inference(tmp_path: str) -> dict:
-    if PREDICTOR is not None:
-        return PREDICTOR.predict(
-            tmp_path,
-            threshold=THRESHOLD,
-            consecutive_windows=CONSECUTIVE_WINDOWS,
-        )
-    return _stub_predict(tmp_path)
-
-
-# ---------------------------------------------------------------------------
-# POST /predict  — Primary endpoint (Member 3 spec)
+# POST /predict  — async job submission (returns instantly)
 # ---------------------------------------------------------------------------
 @app.post("/predict")
 async def predict(video: UploadFile = File(...)):
     """
-    Accept a video file from the Raspberry Pi and return accident verdict.
+    Submit a video for inference. Returns job_id immediately.
+    Poll GET /result/{job_id} for the result.
 
-    Request: multipart/form-data, field name = 'video'
     Response:
-      {
-        "success": true,
-        "accident_detected": true,
-        "risk_score": 0.91,
-        "message": "Potential accident detected",
-        "inference_time_seconds": 1.23,
-        "windows_analysed": 5
-      }
+      { "job_id": "abc123", "status": "queued",
+        "poll_url": "/result/abc123", "message": "Processing started" }
     """
-    allowed = {"video/mp4", "video/avi", "video/x-msvideo", "video/quicktime",
-               "video/x-matroska", "application/octet-stream"}
-    if video.content_type and video.content_type not in allowed:
-        raise HTTPException(
-            status_code=415,
-            detail=f"Unsupported media type: {video.content_type}. Send a video file."
-        )
-
+    job_id = str(uuid.uuid4())[:8]
     suffix = Path(video.filename or "clip.mp4").suffix or ".mp4"
-    request_id = str(uuid.uuid4())[:8]
-    t0 = time.perf_counter()
 
-    logger.info(f"[{request_id}] /predict received: {video.filename} ({video.content_type})")
+    logger.info(f"[{job_id}] /predict received: {video.filename}")
 
+    # Save upload to temp file
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(await video.read())
             tmp_path = tmp.name
     except Exception as exc:
-        logger.error(f"[{request_id}] Failed to save upload: {exc}")
-        raise HTTPException(status_code=500, detail="Failed to save uploaded file")
+        raise HTTPException(500, f"Failed to save upload: {exc}")
 
-    try:
-        result = _run_inference(tmp_path)
-    except ValueError as exc:
-        logger.warning(f"[{request_id}] Video processing error: {exc}")
-        return JSONResponse(status_code=422, content={
-            "success": False,
-            "accident_detected": False,
-            "risk_score": 0.0,
-            "message": f"Video processing error: {exc}",
-            "inference_time_seconds": round(time.perf_counter() - t0, 3),
-            "windows_analysed": 0,
-        })
-    except Exception as exc:
-        logger.error(f"[{request_id}] Inference error: {exc}")
-        return JSONResponse(status_code=500, content={
-            "success": False,
-            "accident_detected": False,
-            "risk_score": 0.0,
-            "message": f"Internal inference error: {exc}",
-            "inference_time_seconds": round(time.perf_counter() - t0, 3),
-            "windows_analysed": 0,
-        })
-    finally:
-        try:
-            Path(tmp_path).unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    accident_detected = result["prediction"] == "ACCIDENT"
-    probs = result["probabilities"]
-    risk_score = round(float(max(probs)) if probs else 0.0, 4)
-    total_time = round(time.perf_counter() - t0, 3)
-
-    logger.info(
-        f"[{request_id}] Result: {result['prediction']} | "
-        f"risk={risk_score} | windows={result['windows']} | "
-        f"total={total_time}s"
-    )
+    # Register job and start background thread
+    JOBS[job_id] = {"status": "processing"}
+    t = threading.Thread(target=_inference_worker, args=(job_id, tmp_path), daemon=True)
+    t.start()
 
     return {
-        "success": True,
-        "accident_detected": accident_detected,
-        "risk_score": risk_score,
-        "message": "Potential accident detected" if accident_detected else "Normal driving",
-        "inference_time_seconds": total_time,
-        "windows_analysed": result["windows"],
+        "job_id":   job_id,
+        "status":   "queued",
+        "poll_url": f"/result/{job_id}",
+        "message":  "Processing started. Poll /result/{job_id} for results.",
     }
 
 
 # ---------------------------------------------------------------------------
-# POST /api/v1/detect  — Contract B endpoint (Member 1 fail-safe)
+# GET /result/{job_id}  — poll for inference result
+# ---------------------------------------------------------------------------
+@app.get("/result/{job_id}")
+async def get_result(job_id: str):
+    """
+    Poll for inference result.
+    Returns "processing" until done, then full result.
+
+    Example response when done:
+      { "status": "done", "accident_detected": true,
+        "risk_score": 0.87, "inference_time_seconds": 45.2 }
+    """
+    if job_id not in JOBS:
+        raise HTTPException(404, f"Job {job_id} not found")
+    return JOBS[job_id]
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/detect  — Contract B (sync, for Member 1 fail-safe)
+# This endpoint starts inference in background but returns queued status.
+# Member 1 should poll /result/{job_id} for the final result.
 # ---------------------------------------------------------------------------
 @app.post("/api/v1/detect")
 async def detect_contract_b(
-    video: UploadFile = File(...),
-    event_id: str = Form(default=None),
+    video:      UploadFile = File(...),
+    event_id:   str   = Form(default=None),
     peak_accel: float = Form(default=0.0),
-    latitude: float = Form(default=0.0),
-    longitude: float = Form(default=0.0),
+    latitude:   float = Form(default=0.0),
+    longitude:  float = Form(default=0.0),
 ):
     """
-    Contract B response for Member 1's fail-safe logic.
-    Fields: event_id, accident_confirmed (bool), confidence (float 0-1), status (str)
+    Contract B endpoint for Member 1 fail-safe logic.
+    Starts async inference, returns job_id to poll.
     """
-    eid = event_id or str(uuid.uuid4())
-    t0 = time.perf_counter()
+    eid    = event_id or str(uuid.uuid4())[:8]
     suffix = Path(video.filename or "clip.mp4").suffix or ".mp4"
 
     logger.info(f"[{eid}] /api/v1/detect received | peak_accel={peak_accel}")
@@ -264,56 +265,21 @@ async def detect_contract_b(
             tmp.write(await video.read())
             tmp_path = tmp.name
     except Exception as exc:
-        logger.error(f"[{eid}] Save failed: {exc}")
-        return JSONResponse(status_code=500, content={
-            "event_id": eid,
-            "accident_confirmed": False,
-            "confidence": 0.0,
-            "status": "error",
+        return JSONResponse(500, content={
+            "event_id": eid, "accident_confirmed": False,
+            "confidence": 0.0, "status": "error",
         })
 
-    try:
-        result = _run_inference(tmp_path)
-    except Exception as exc:
-        logger.error(f"[{eid}] Inference failed: {exc}")
-        return JSONResponse(status_code=500, content={
-            "event_id": eid,
-            "accident_confirmed": False,
-            "confidence": 0.0,
-            "status": "error",
-        })
-    finally:
-        try:
-            Path(tmp_path).unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    elapsed = time.perf_counter() - t0
-    if elapsed > 5.0:
-        logger.warning(f"[{eid}] Timeout SLA exceeded: {elapsed:.2f}s")
-        return JSONResponse(status_code=504, content={
-            "event_id": eid,
-            "accident_confirmed": False,
-            "confidence": 0.0,
-            "status": "timeout",
-        })
-
-    accident_confirmed = result["prediction"] == "ACCIDENT"
-    probs = result["probabilities"]
-    confidence = round(float(max(probs)) if probs else 0.0, 4)
-
-    # Sensor fusion: MPU6050 high-G boost
-    if peak_accel > 25.0 and confidence > 0.3:
-        confidence = min(1.0, confidence + 0.1)
-        logger.info(f"[{eid}] Sensor fusion boost: peak_accel={peak_accel}")
-
-    logger.info(f"[{eid}] Contract B: confirmed={accident_confirmed} confidence={confidence} elapsed={elapsed:.2f}s")
+    JOBS[eid] = {"status": "processing"}
+    t = threading.Thread(target=_inference_worker, args=(eid, tmp_path), daemon=True)
+    t.start()
 
     return {
-        "event_id": eid,
-        "accident_confirmed": accident_confirmed,
-        "confidence": confidence,
-        "status": "ok",
+        "event_id":  eid,
+        "status":    "queued",
+        "poll_url":  f"/result/{eid}",
+        "message":   "Processing started. Poll /result/{eid} for accident_confirmed.",
+        "peak_accel": peak_accel,
     }
 
 
@@ -323,46 +289,59 @@ async def detect_contract_b(
 @app.get("/health")
 async def health():
     return {
-        "status": "ok",
-        "model_loaded": PREDICTOR is not None,
-        "model_error": MODEL_LOAD_ERROR,
-        "device": str(DEVICE) if DEVICE else "none",
-        "checkpoint": str(CHECKPOINT_PATH),
-        "threshold": THRESHOLD,
-        "consecutive_windows": CONSECUTIVE_WINDOWS,
+        "status":             "ok",
+        "model_loaded":       PREDICTOR is not None,
+        "model_error":        MODEL_LOAD_ERROR,
+        "device":             str(DEVICE) if DEVICE else "none",
+        "checkpoint":         str(CHECKPOINT_PATH),
+        "threshold":          THRESHOLD,
+        "consecutive_windows": CONSEC_WINDOWS,
+        "active_jobs":        len([j for j in JOBS.values() if j.get("status") == "processing"]),
     }
 
 
 # ---------------------------------------------------------------------------
-# GET /  — Status page
+# GET /  — Dashboard
 # ---------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 async def root():
     model_status = (
-        f"Loaded on <b>{DEVICE}</b>"
-        if PREDICTOR is not None
-        else f"Stub mode (no weights) — {MODEL_LOAD_ERROR}"
+        f"Loaded on <b>{DEVICE}</b>" if PREDICTOR
+        else f"Stub mode — {MODEL_LOAD_ERROR}"
     )
     return f"""<!DOCTYPE html>
-<html><head><title>Accident Detection API</title>
+<html><head><title>Accident Detection API v3</title>
 <style>
-body{{font-family:sans-serif;max-width:700px;margin:40px auto;padding:0 20px}}
-code{{background:#f4f4f4;padding:2px 6px;border-radius:4px}}
-pre{{background:#1e1e1e;color:#d4d4d4;padding:16px;border-radius:8px;overflow-x:auto}}
+body{{font-family:sans-serif;max-width:750px;margin:40px auto;padding:0 20px;line-height:1.6}}
+code,pre{{background:#f4f4f4;padding:2px 6px;border-radius:4px;font-size:0.9em}}
+pre{{display:block;padding:12px;white-space:pre-wrap}}
+h3{{margin-bottom:4px}}
 </style></head><body>
-<h1>Accident Detection Cloud API v2.0</h1>
+<h1>Accident Detection Cloud API v3.0</h1>
 <p>Model: {model_status}</p>
 <hr>
-<h2>Endpoints</h2>
-<h3>POST /predict</h3>
-<p>Primary endpoint. Send video as <code>multipart/form-data</code>, field <code>video</code>.</p>
-<pre>curl -X POST https://YOUR_URL/predict -F "video=@clip.mp4"</pre>
-<pre>Response: {{"success":true,"accident_detected":true,"risk_score":0.91,"message":"Potential accident detected","inference_time_seconds":1.23,"windows_analysed":5}}</pre>
-<h3>POST /api/v1/detect</h3>
-<p>Contract B endpoint for Member 1 fail-safe logic.</p>
-<pre>curl -X POST https://YOUR_URL/api/v1/detect -F "video=@clip.mp4" -F "event_id=evt_001" -F "peak_accel=28.5"</pre>
-<pre>Response: {{"event_id":"evt_001","accident_confirmed":true,"confidence":0.91,"status":"ok"}}</pre>
-<h3>GET /health</h3>
-<p>Returns model load status and config.</p>
+<h2>How to Use (Async Flow)</h2>
+<pre>
+Step 1 — Submit video:
+  POST /predict
+  Form field: video (mp4 file)
+  Returns:  {{"job_id": "abc123", "poll_url": "/result/abc123"}}
+
+Step 2 — Poll for result:
+  GET /result/abc123
+  Returns "processing" until done, then:
+  {{
+    "status": "done",
+    "accident_detected": true,
+    "risk_score": 0.87,
+    "message": "Potential accident detected",
+    "inference_time_seconds": 45.2,
+    "windows_analysed": 3
+  }}
+</pre>
+<h3>Contract B (Member 1 fail-safe)</h3>
+<pre>POST /api/v1/detect  — same async flow, event_id as job_id</pre>
+<h3>Health</h3>
+<pre>GET /health  — model status, active jobs</pre>
 <p><a href="/docs">Interactive API Docs (Swagger UI)</a></p>
 </body></html>"""
