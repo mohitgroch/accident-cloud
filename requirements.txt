@@ -1,20 +1,8 @@
-# Accident Detection Cloud API — Python dependencies
-# Install: pip install -r requirements.txt
-
-# Web framework
-fastapi==0.115.5
-uvicorn[standard]==0.32.1
-
-# ML / inference (teammate's model)
-torch==2.5.1
-torchvision==0.20.1
-
-# Video processing
-opencv-python-headless==4.10.0.84
-
-# Utilities
-numpy==1.26.4
-python-multipart==0.0.12
-
-# Model download from Google Drive (large file, not in repo)
-gdown==5.2.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+torch>=2.0.0
+torchvision>=0.15.0
+opencv-python-headless>=4.9.0
+numpy>=1.24.0
+python-multipart>=0.0.9
+gdown>=5.1.0
